@@ -23,111 +23,186 @@ class PredictionBundle:
     extra: dict
 
 
-def model_specs(random_state=42):
+def model_specs(random_state=42, overrides=None):
+    overrides = overrides or {}
+
+    def params(name, defaults):
+        return {**defaults, **overrides.get(name, {})}
+
     return {
         "SVC": {
             "kind": "classifier",
             "estimator": make_pipeline(
                 StandardScaler(),
-                SVC(C=1.0, gamma="scale", class_weight="balanced", probability=True),
+                SVC(
+                    **params(
+                        "SVC",
+                        {
+                            "C": 1.0,
+                            "gamma": "scale",
+                            "class_weight": "balanced",
+                            "probability": True,
+                            "random_state": random_state,
+                        },
+                    )
+                ),
             ),
         },
         "SVR": {
             "kind": "regressor",
-            "estimator": make_pipeline(StandardScaler(), SVR(C=5.0, epsilon=0.001, gamma="scale")),
+            "estimator": make_pipeline(
+                StandardScaler(),
+                SVR(**params("SVR", {"C": 5.0, "epsilon": 0.001, "gamma": "scale"})),
+            ),
         },
         "Random Forest": {
             "kind": "both",
             "classifier": RandomForestClassifier(
-                n_estimators=350,
-                max_depth=7,
-                min_samples_leaf=20,
-                class_weight="balanced_subsample",
-                random_state=random_state,
-                n_jobs=-1,
+                **params(
+                    "Random Forest",
+                    {
+                        "n_estimators": 350,
+                        "max_depth": 7,
+                        "min_samples_leaf": 20,
+                        "class_weight": "balanced_subsample",
+                        "random_state": random_state,
+                        "n_jobs": -1,
+                    },
+                )
             ),
             "regressor": RandomForestRegressor(
-                n_estimators=350,
-                max_depth=7,
-                min_samples_leaf=20,
-                random_state=random_state,
-                n_jobs=-1,
+                **{
+                    key: value
+                    for key, value in params(
+                        "Random Forest",
+                        {
+                            "n_estimators": 350,
+                            "max_depth": 7,
+                            "min_samples_leaf": 20,
+                            "random_state": random_state,
+                            "n_jobs": -1,
+                        },
+                    ).items()
+                    if key != "class_weight"
+                }
             ),
         },
         "XGBoost": {
             "kind": "both",
             "classifier": XGBClassifier(
-                n_estimators=250,
-                max_depth=3,
-                learning_rate=0.035,
-                subsample=0.85,
-                colsample_bytree=0.85,
-                reg_lambda=2.0,
-                objective="binary:logistic",
-                eval_metric="logloss",
-                random_state=random_state,
-                n_jobs=-1,
+                **params(
+                    "XGBoost",
+                    {
+                        "n_estimators": 250,
+                        "max_depth": 3,
+                        "learning_rate": 0.035,
+                        "subsample": 0.85,
+                        "colsample_bytree": 0.85,
+                        "reg_lambda": 2.0,
+                        "objective": "binary:logistic",
+                        "eval_metric": "logloss",
+                        "random_state": random_state,
+                        "n_jobs": -1,
+                    },
+                )
             ),
             "regressor": XGBRegressor(
-                n_estimators=250,
-                max_depth=3,
-                learning_rate=0.035,
-                subsample=0.85,
-                colsample_bytree=0.85,
-                reg_lambda=2.0,
-                objective="reg:squarederror",
-                random_state=random_state,
-                n_jobs=-1,
+                **{
+                    key: value
+                    for key, value in params(
+                        "XGBoost",
+                        {
+                            "n_estimators": 250,
+                            "max_depth": 3,
+                            "learning_rate": 0.035,
+                            "subsample": 0.85,
+                            "colsample_bytree": 0.85,
+                            "reg_lambda": 2.0,
+                            "objective": "reg:squarederror",
+                            "random_state": random_state,
+                            "n_jobs": -1,
+                        },
+                    ).items()
+                    if key != "eval_metric"
+                }
             ),
         },
         "LightGBM": {
             "kind": "both",
             "classifier": LGBMClassifier(
-                n_estimators=300,
-                max_depth=4,
-                learning_rate=0.025,
-                num_leaves=15,
-                subsample=0.85,
-                colsample_bytree=0.85,
-                reg_lambda=2.0,
-                class_weight="balanced",
-                random_state=random_state,
-                n_jobs=-1,
-                verbose=-1,
+                **params(
+                    "LightGBM",
+                    {
+                        "n_estimators": 300,
+                        "max_depth": 4,
+                        "learning_rate": 0.025,
+                        "num_leaves": 15,
+                        "subsample": 0.85,
+                        "colsample_bytree": 0.85,
+                        "reg_lambda": 2.0,
+                        "class_weight": "balanced",
+                        "random_state": random_state,
+                        "n_jobs": -1,
+                        "verbose": -1,
+                    },
+                )
             ),
             "regressor": LGBMRegressor(
-                n_estimators=300,
-                max_depth=4,
-                learning_rate=0.025,
-                num_leaves=15,
-                subsample=0.85,
-                colsample_bytree=0.85,
-                reg_lambda=2.0,
-                random_state=random_state,
-                n_jobs=-1,
-                verbose=-1,
+                **{
+                    key: value
+                    for key, value in params(
+                        "LightGBM",
+                        {
+                            "n_estimators": 300,
+                            "max_depth": 4,
+                            "learning_rate": 0.025,
+                            "num_leaves": 15,
+                            "subsample": 0.85,
+                            "colsample_bytree": 0.85,
+                            "reg_lambda": 2.0,
+                            "random_state": random_state,
+                            "n_jobs": -1,
+                            "verbose": -1,
+                        },
+                    ).items()
+                    if key != "class_weight"
+                }
             ),
         },
         "CatBoost": {
             "kind": "both",
             "classifier": CatBoostClassifier(
-                iterations=280,
-                depth=4,
-                learning_rate=0.035,
-                loss_function="Logloss",
-                auto_class_weights="Balanced",
-                random_seed=random_state,
-                verbose=False,
-                allow_writing_files=False,
+                **params(
+                    "CatBoost",
+                    {
+                        "iterations": 280,
+                        "depth": 4,
+                        "learning_rate": 0.035,
+                        "loss_function": "Logloss",
+                        "auto_class_weights": "Balanced",
+                        "random_seed": random_state,
+                        "verbose": False,
+                        "allow_writing_files": False,
+                    },
+                )
             ),
             "regressor": CatBoostRegressor(
-                iterations=280,
-                depth=4,
-                learning_rate=0.035,
-                loss_function="RMSE",
-                random_seed=random_state,
-                verbose=False,
-                allow_writing_files=False,
+                **{
+                    key: value
+                    for key, value in params(
+                        "CatBoost",
+                        {
+                            "iterations": 280,
+                            "depth": 4,
+                            "learning_rate": 0.035,
+                            "loss_function": "RMSE",
+                            "random_seed": random_state,
+                            "verbose": False,
+                            "allow_writing_files": False,
+                        },
+                    ).items()
+                    if key != "auto_class_weights"
+                }
             ),
         },
     }
@@ -183,7 +258,7 @@ def fit_predict_macd(train_df, test_df, horizon):
     return PredictionBundle("MACD 12-26-9", pred_dir, pred_ret, pred_dir.astype(float), {"signal_return_map": mapping})
 
 
-def fit_predict_hmm(train_df, test_df, feature_cols, horizon, random_state=42):
+def fit_predict_hmm(train_df, test_df, feature_cols, horizon, random_state=42, hmm_params=None):
     hmm_features = [
         col
         for col in ["log_ret_1", "ret_5", "ret_20", "vol_20", "vol_60", "range_pct", "macd_hist", "rsi_14"]
@@ -192,7 +267,14 @@ def fit_predict_hmm(train_df, test_df, feature_cols, horizon, random_state=42):
     scaler = StandardScaler()
     x_train = scaler.fit_transform(train_df[hmm_features])
     x_test = scaler.transform(test_df[hmm_features])
-    model = GaussianHMM(n_components=4, covariance_type="diag", n_iter=400, random_state=random_state)
+    params = {
+        "n_components": 4,
+        "covariance_type": "diag",
+        "n_iter": 400,
+        "random_state": random_state,
+    }
+    params.update(hmm_params or {})
+    model = GaussianHMM(**params)
     model.fit(x_train)
     train_states = model.predict(x_train)
     test_states = model.predict(x_test)

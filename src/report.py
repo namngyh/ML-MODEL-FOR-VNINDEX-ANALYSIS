@@ -43,6 +43,10 @@ def write_readme(
     ranking: pd.DataFrame,
     future_forecasts: pd.DataFrame,
     future_consensus: pd.DataFrame,
+    baseline_ranking: pd.DataFrame,
+    tuning_trials: pd.DataFrame,
+    best_parameters: pd.DataFrame,
+    tuning_comparison: pd.DataFrame,
     artifacts: dict,
 ):
     best_by_horizon = (
@@ -70,6 +74,58 @@ def write_readme(
         future_consensus_view[col] = future_consensus_view[col].map(lambda x: f"{x:.2%}")
     for col in ["median_predicted_close", "weighted_predicted_close"]:
         future_consensus_view[col] = future_consensus_view[col].map(lambda x: f"{x:,.2f}")
+
+    tuned_models = tuning_comparison[
+        tuning_comparison["model"] != "MACD 12-26-9"
+    ].copy()
+    tuning_summary = (
+        tuned_models.groupby("horizon")
+        .agg(
+            models=("model", "size"),
+            models_improved=("improved_composite_score", "sum"),
+            mean_delta_composite_score=("delta_composite_score", "mean"),
+            mean_delta_balanced_accuracy=("delta_balanced_accuracy", "mean"),
+            mean_delta_spearman_ic=("delta_spearman_ic", "mean"),
+            mean_delta_strategy_sharpe=("delta_strategy_sharpe", "mean"),
+        )
+        .reset_index()
+    )
+    tuning_detail = tuned_models[
+        [
+            "horizon",
+            "model",
+            "candidate_id",
+            "delta_composite_score",
+            "delta_rank_score",
+            "delta_balanced_accuracy",
+            "delta_spearman_ic",
+            "delta_strategy_sharpe",
+            "improved_composite_score",
+        ]
+    ].sort_values(["horizon", "delta_composite_score"], ascending=[True, False])
+    parameter_view = best_parameters[
+        [
+            "horizon",
+            "model",
+            "candidate_id",
+            "cv_score",
+            "cv_score_std",
+            "selected_params",
+        ]
+    ].sort_values(["horizon", "model"])
+    total_search_minutes = tuning_trials["fit_seconds"].sum() / 60
+    changed_parameters = int((best_parameters["candidate_id"] != 0).sum())
+    tuning_notes = []
+    for horizon, group in tuned_models.groupby("horizon"):
+        best = group.loc[group["delta_composite_score"].idxmax()]
+        worst = group.loc[group["delta_composite_score"].idxmin()]
+        improved = int(group["improved_composite_score"].sum())
+        tuning_notes.append(
+            f"- Horizon {int(horizon)} phiên: {improved}/{len(group)} mô hình tăng điểm tổng hợp trên test. "
+            f"Cải thiện lớn nhất là {best['model']} ({best['delta_composite_score']:+.4f}); "
+            f"giảm nhiều nhất là {worst['model']} ({worst['delta_composite_score']:+.4f})."
+        )
+    tuning_narrative = "\n".join(tuning_notes)
 
     latest_date = future_consensus["as_of_date"].iloc[0]
     latest_close = future_consensus["latest_close"].iloc[0]
@@ -104,6 +160,40 @@ Trọng tâm là dự báo theo 3 khung thời gian:
 - Chia tập: theo thời gian, không shuffle, tránh leakage
 - Chiến lược tài chính: long/flat; nếu mô hình dự báo tăng thì nắm giữ cho phiên kế tiếp, nếu không thì đứng ngoài
 - MACD baseline: `MACD line > Signal line` được xem là tín hiệu bullish để dự báo hướng
+
+## Tối ưu hyperparameter nhẹ
+
+Mỗi mô hình ML/HMM có 4 cấu hình ứng viên cho từng horizon. Việc chọn tham số dùng
+TimeSeriesSplit với 3 fold và gap bằng chính horizon trên riêng phần train + validation.
+Tập test cuối không tham gia chọn tham số.
+
+Điểm CV tổng hợp gồm 45% Balanced Accuracy, 20% F1, 20% IC score và 15% Sharpe score.
+IC và Sharpe được co về thang 0-1 trước khi cộng. Search đã đánh giá
+{len(tuning_trials)} tổ hợp model-horizon-candidate, tổng thời gian fit cộng dồn khoảng
+{total_search_minutes:.1f} phút. Có {changed_parameters}/{len(best_parameters)} lựa chọn
+rời khỏi cấu hình baseline.
+
+### Tuning có cải thiện thật trên test không?
+
+{tuning_narrative}
+
+Tổng hợp trung bình theo horizon:
+
+{_markdown_table(tuning_summary, ["horizon", "models", "models_improved", "mean_delta_composite_score", "mean_delta_balanced_accuracy", "mean_delta_spearman_ic", "mean_delta_strategy_sharpe"], max_rows=10)}
+
+Chi tiết thay đổi theo mô hình; delta dương nghĩa là tuned tốt hơn baseline trên test:
+
+{_markdown_table(tuning_detail, ["horizon", "model", "candidate_id", "delta_composite_score", "delta_rank_score", "delta_balanced_accuracy", "delta_spearman_ic", "delta_strategy_sharpe", "improved_composite_score"], max_rows=30)}
+
+Tham số được chọn:
+
+{_markdown_table(parameter_view, ["horizon", "model", "candidate_id", "cv_score", "cv_score_std", "selected_params"], max_rows=30)}
+
+![Tuning Delta Heatmaps]({artifacts["tuning_deltas"]})
+
+![CV Search Scores]({artifacts["cv_search"]})
+
+![Baseline vs Tuned]({artifacts["baseline_vs_tuned"]})
 
 ### Split thời gian
 
@@ -239,8 +329,19 @@ Kết quả được ghi vào `outputs/`:
 - `regime_summary.csv`: trạng thái HMM và return kỳ vọng theo regime.
 - `figures/*.png`: toàn bộ biểu đồ.
 
+Các file tuning bổ sung:
+
+- baseline metrics, financial metrics, predictions và ranking: kết quả cấu hình trước tuning trên cùng tập test.
+- tuning_trials.csv: toàn bộ 84 trial và điểm cross-validation.
+- best_hyperparameters.csv: tham số thắng cho từng model và horizon.
+- tuning_comparison.csv: so sánh out-of-sample baseline với tuned.
+
 ## Lưu ý diễn giải
 
-Kết quả này là out-of-sample theo split thời gian, nhưng vẫn là nghiên cứu lịch sử. Nếu dùng giao dịch thật cần bổ sung transaction cost, slippage, walk-forward retraining, kiểm định ổn định theo từng giai đoạn thị trường và quản trị rủi ro vị thế.
+Kết quả này là out-of-sample theo split thời gian, nhưng vẫn là nghiên cứu lịch sử. Search nhẹ
+giảm chi phí tính toán nhưng không đảm bảo mọi mô hình đều tốt hơn trên test; chính các delta âm
+trong bảng là bằng chứng cần giữ lại thay vì chỉ báo cáo mô hình thắng. Nếu dùng giao dịch thật cần
+bổ sung transaction cost, slippage, nested/walk-forward retraining, kiểm định ổn định theo từng
+regime và quản trị rủi ro vị thế.
 """
     output_path.write_text(body, encoding="utf-8")

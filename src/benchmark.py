@@ -17,6 +17,8 @@ from src.models import (
     model_specs,
 )
 from src.plots import (
+    plot_baseline_vs_tuned,
+    plot_cv_search_scores,
     plot_equity_curves,
     plot_feature_importance,
     plot_forecast_panel,
@@ -26,9 +28,11 @@ from src.plots import (
     plot_future_return_forecast,
     plot_metric_heatmap,
     plot_price_macd,
+    plot_tuning_delta_heatmaps,
     setup_plot_style,
 )
 from src.report import write_readme
+from src.tuning import tune_horizon
 
 
 def _split_summary(train, valid, test):
@@ -51,6 +55,16 @@ def _rank(metrics: pd.DataFrame, financial: pd.DataFrame):
     ranked_parts = []
     for horizon, group in merged.groupby("horizon"):
         scored = group.copy()
+        ic_score = 0.5 + 0.5 * scored["spearman_ic"].fillna(0).clip(-1, 1)
+        sharpe_score = 0.5 + 0.5 * np.tanh(
+            scored["strategy_sharpe"].fillna(0) / 2.0
+        )
+        scored["composite_score"] = (
+            0.45 * scored["balanced_accuracy"]
+            + 0.20 * scored["f1"]
+            + 0.20 * ic_score
+            + 0.15 * sharpe_score
+        )
         ranks = []
         for col in score_cols:
             values = scored[col].replace([np.inf, -np.inf], np.nan)
@@ -87,7 +101,14 @@ def _make_prediction_rows(test, bundle, horizon):
     )
 
 
-def _build_future_forecasts(full_df, feature_cols, specs, ranking, horizons):
+def _build_future_forecasts(
+    full_df,
+    feature_cols,
+    specs_by_horizon,
+    hmm_params_by_horizon,
+    ranking,
+    horizons,
+):
     latest = full_df.dropna(subset=feature_cols).iloc[[-1]].copy()
     latest_date = latest["date"].iloc[0]
     latest_close = latest["close"].iloc[0]
@@ -95,6 +116,7 @@ def _build_future_forecasts(full_df, feature_cols, specs, ranking, horizons):
     regime_rows = []
 
     for horizon in horizons:
+        specs = specs_by_horizon[horizon]
         target_return = f"future_return_{horizon}d"
         target_up = f"future_up_{horizon}d"
         train_df = full_df.dropna(subset=feature_cols + [target_return]).copy()
@@ -106,7 +128,13 @@ def _build_future_forecasts(full_df, feature_cols, specs, ranking, horizons):
         bundles = [fit_predict_macd(train_df, latest, horizon)]
         for name, spec in specs.items():
             bundles.append(fit_predict_supervised(name, spec, x_train, y_train_ret, y_train_up, x_future))
-        hmm_bundle = fit_predict_hmm(train_df, latest, feature_cols, horizon)
+        hmm_bundle = fit_predict_hmm(
+            train_df,
+            latest,
+            feature_cols,
+            horizon,
+            hmm_params=hmm_params_by_horizon[horizon],
+        )
         bundles.append(hmm_bundle)
 
         for bundle in bundles:
@@ -188,6 +216,44 @@ def _build_future_forecasts(full_df, feature_cols, specs, ranking, horizons):
     return future, pd.DataFrame(consensus_rows), pd.DataFrame(regime_rows)
 
 
+def _compare_variants(baseline_ranking, tuned_ranking, best_parameters):
+    metric_cols = [
+        "rank_score",
+        "composite_score",
+        "balanced_accuracy",
+        "f1",
+        "spearman_ic",
+        "r2",
+        "strategy_sharpe",
+        "strategy_total_return",
+        "strategy_max_drawdown",
+    ]
+    baseline = baseline_ranking[["horizon", "model", *metric_cols]].rename(
+        columns={col: f"baseline_{col}" for col in metric_cols}
+    )
+    tuned = tuned_ranking[["horizon", "model", *metric_cols]].rename(
+        columns={col: f"tuned_{col}" for col in metric_cols}
+    )
+    comparison = baseline.merge(tuned, on=["horizon", "model"], how="outer")
+    for col in metric_cols:
+        comparison[f"delta_{col}"] = comparison[f"tuned_{col}"] - comparison[f"baseline_{col}"]
+    comparison["improved_rank_score"] = comparison["delta_rank_score"] > 0
+    comparison["improved_composite_score"] = comparison["delta_composite_score"] > 1e-12
+    selected = best_parameters[
+        [
+            "horizon",
+            "model",
+            "candidate_id",
+            "is_baseline_candidate",
+            "selected_params",
+            "cv_score",
+            "cv_score_std",
+            "fit_seconds",
+        ]
+    ]
+    return comparison.merge(selected, on=["horizon", "model"], how="left")
+
+
 def run_benchmark(data_path: Path, output_dir: Path, horizons=(5, 20, 60)):
     output_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = output_dir / "figures"
@@ -203,14 +269,33 @@ def run_benchmark(data_path: Path, output_dir: Path, horizons=(5, 20, 60)):
     split_summary = _split_summary(train, valid, test)
 
     train_valid = pd.concat([train, valid], ignore_index=True)
-    specs = model_specs()
+    baseline_specs = model_specs()
+    tuned_specs_by_horizon = {}
+    hmm_params_by_horizon = {}
     prediction_frames = []
+    baseline_prediction_frames = []
     metric_rows = []
+    baseline_metric_rows = []
     financial_rows = []
+    baseline_financial_rows = []
     importance_rows = []
     regime_rows = []
+    tuning_trial_frames = []
+    best_parameter_frames = []
 
     for horizon in horizons:
+        print(f"Tuning horizon {horizon} phien...")
+        overrides, hmm_params, trials, best_params = tune_horizon(
+            train_valid,
+            feature_cols,
+            horizon,
+        )
+        tuned_specs = model_specs(overrides=overrides)
+        tuned_specs_by_horizon[horizon] = tuned_specs
+        hmm_params_by_horizon[horizon] = hmm_params
+        tuning_trial_frames.append(trials)
+        best_parameter_frames.append(best_params)
+
         target_return = f"future_return_{horizon}d"
         target_up = f"future_up_{horizon}d"
         x_train = train_valid[feature_cols]
@@ -220,45 +305,91 @@ def run_benchmark(data_path: Path, output_dir: Path, horizons=(5, 20, 60)):
         y_test_ret = test[target_return]
         y_test_up = test[target_up].astype(int)
 
-        bundles = [fit_predict_macd(train_valid, test, horizon)]
-        for name, spec in specs.items():
-            bundles.append(fit_predict_supervised(name, spec, x_train, y_train_ret, y_train_up, x_test))
-        hmm_bundle = fit_predict_hmm(train_valid, test, feature_cols, horizon)
-        bundles.append(hmm_bundle)
+        baseline_bundles = [fit_predict_macd(train_valid, test, horizon)]
+        for name, spec in baseline_specs.items():
+            baseline_bundles.append(
+                fit_predict_supervised(name, spec, x_train, y_train_ret, y_train_up, x_test)
+            )
+        baseline_bundles.append(fit_predict_hmm(train_valid, test, feature_cols, horizon))
+
+        tuned_bundles = [fit_predict_macd(train_valid, test, horizon)]
+        for name, spec in tuned_specs.items():
+            tuned_bundles.append(
+                fit_predict_supervised(name, spec, x_train, y_train_ret, y_train_up, x_test)
+            )
+        hmm_bundle = fit_predict_hmm(
+            train_valid,
+            test,
+            feature_cols,
+            horizon,
+            hmm_params=hmm_params,
+        )
+        tuned_bundles.append(hmm_bundle)
         for state, mean_return in hmm_bundle.extra["state_mean_return"].items():
             regime_rows.append({"horizon": horizon, "state": state, "mean_forward_return": mean_return})
 
-        for bundle in bundles:
-            preds = _make_prediction_rows(test, bundle, horizon)
-            prediction_frames.append(preds)
-            cls = classification_metrics(y_test_up, bundle.pred_direction, bundle.score_up)
-            reg = regression_metrics(y_test_ret, bundle.pred_return)
-            metric_rows.append({"horizon": horizon, "model": bundle.model, **cls, **reg})
-            fin = financial_metrics(
-                preds["date"],
-                preds["strategy_return"],
-                preds["buy_hold_return"],
-                preds["pred_direction"],
-            )
-            financial_rows.append({"horizon": horizon, "model": bundle.model, **fin})
-            importance_rows.extend(feature_importance_rows(bundle, feature_cols, horizon))
+        variants = [
+            (
+                baseline_bundles,
+                baseline_prediction_frames,
+                baseline_metric_rows,
+                baseline_financial_rows,
+                False,
+            ),
+            (tuned_bundles, prediction_frames, metric_rows, financial_rows, True),
+        ]
+        for bundles, pred_store, metric_store, financial_store, is_tuned in variants:
+            for bundle in bundles:
+                preds = _make_prediction_rows(test, bundle, horizon)
+                pred_store.append(preds)
+                cls = classification_metrics(y_test_up, bundle.pred_direction, bundle.score_up)
+                reg = regression_metrics(y_test_ret, bundle.pred_return)
+                metric_store.append({"horizon": horizon, "model": bundle.model, **cls, **reg})
+                fin = financial_metrics(
+                    preds["date"],
+                    preds["strategy_return"],
+                    preds["buy_hold_return"],
+                    preds["pred_direction"],
+                )
+                financial_store.append({"horizon": horizon, "model": bundle.model, **fin})
+                if is_tuned:
+                    importance_rows.extend(feature_importance_rows(bundle, feature_cols, horizon))
 
     predictions = pd.concat(prediction_frames, ignore_index=True)
+    baseline_predictions = pd.concat(baseline_prediction_frames, ignore_index=True)
     metrics = pd.DataFrame(metric_rows)
+    baseline_metrics = pd.DataFrame(baseline_metric_rows)
     financial = pd.DataFrame(financial_rows)
+    baseline_financial = pd.DataFrame(baseline_financial_rows)
     feature_importance = pd.DataFrame(importance_rows)
     regime_summary = pd.DataFrame(regime_rows)
+    tuning_trials = pd.concat(tuning_trial_frames, ignore_index=True)
+    best_parameters = pd.concat(best_parameter_frames, ignore_index=True)
     ranking = _rank(metrics, financial)
+    baseline_ranking = _rank(baseline_metrics, baseline_financial)
+    tuning_comparison = _compare_variants(baseline_ranking, ranking, best_parameters)
     future_forecasts, future_consensus, current_regime = _build_future_forecasts(
-        full_df, feature_cols, specs, ranking, horizons
+        full_df,
+        feature_cols,
+        tuned_specs_by_horizon,
+        hmm_params_by_horizon,
+        ranking,
+        horizons,
     )
 
     raw.to_csv(output_dir / "clean_vnindex_data.csv", index=False)
     split_summary.to_csv(output_dir / "split_summary.csv", index=False)
     predictions.to_csv(output_dir / "predictions.csv", index=False)
+    baseline_predictions.to_csv(output_dir / "baseline_predictions.csv", index=False)
     metrics.to_csv(output_dir / "metrics_by_horizon.csv", index=False)
+    baseline_metrics.to_csv(output_dir / "baseline_metrics_by_horizon.csv", index=False)
     financial.to_csv(output_dir / "financial_metrics_by_horizon.csv", index=False)
+    baseline_financial.to_csv(output_dir / "baseline_financial_metrics_by_horizon.csv", index=False)
     ranking.to_csv(output_dir / "model_ranking.csv", index=False)
+    baseline_ranking.to_csv(output_dir / "baseline_model_ranking.csv", index=False)
+    tuning_trials.to_csv(output_dir / "tuning_trials.csv", index=False)
+    best_parameters.to_csv(output_dir / "best_hyperparameters.csv", index=False)
+    tuning_comparison.to_csv(output_dir / "tuning_comparison.csv", index=False)
     feature_importance.to_csv(output_dir / "feature_importance.csv", index=False)
     regime_summary.to_csv(output_dir / "regime_summary.csv", index=False)
     future_forecasts.to_csv(output_dir / "future_forecasts.csv", index=False)
@@ -277,6 +408,13 @@ def run_benchmark(data_path: Path, output_dir: Path, horizons=(5, 20, 60)):
     plot_future_price_targets(future_forecasts, future_consensus, figures_dir / "08_future_price_targets.png")
     plot_future_consensus(future_forecasts, future_consensus, figures_dir / "09_future_consensus_dashboard.png")
     plot_future_model_heatmap(future_forecasts, figures_dir / "10_future_model_heatmap.png")
+    plot_tuning_delta_heatmaps(
+        tuning_comparison, figures_dir / "11_tuning_delta_heatmaps.png"
+    )
+    plot_cv_search_scores(tuning_trials, figures_dir / "12_cv_search_scores.png")
+    plot_baseline_vs_tuned(
+        tuning_comparison, figures_dir / "13_baseline_vs_tuned_composite_score.png"
+    )
 
     artifacts = {
         "price_macd": "outputs/figures/01_price_macd_rsi.png",
@@ -293,6 +431,9 @@ def run_benchmark(data_path: Path, output_dir: Path, horizons=(5, 20, 60)):
         "future_price_targets": "outputs/figures/08_future_price_targets.png",
         "future_consensus": "outputs/figures/09_future_consensus_dashboard.png",
         "future_heatmap": "outputs/figures/10_future_model_heatmap.png",
+        "tuning_deltas": "outputs/figures/11_tuning_delta_heatmaps.png",
+        "cv_search": "outputs/figures/12_cv_search_scores.png",
+        "baseline_vs_tuned": "outputs/figures/13_baseline_vs_tuned_composite_score.png",
     }
     write_readme(
         Path("README.md"),
@@ -307,6 +448,10 @@ def run_benchmark(data_path: Path, output_dir: Path, horizons=(5, 20, 60)):
         ranking,
         future_forecasts,
         future_consensus,
+        baseline_ranking,
+        tuning_trials,
+        best_parameters,
+        tuning_comparison,
         artifacts,
     )
 
@@ -315,4 +460,6 @@ def run_benchmark(data_path: Path, output_dir: Path, horizons=(5, 20, 60)):
     print(f"- {output_dir / 'model_ranking.csv'}")
     print(f"- {output_dir / 'metrics_by_horizon.csv'}")
     print(f"- {output_dir / 'financial_metrics_by_horizon.csv'}")
+    print(f"- {output_dir / 'best_hyperparameters.csv'}")
+    print(f"- {output_dir / 'tuning_comparison.csv'}")
     print(f"- {figures_dir}")

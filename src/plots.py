@@ -199,3 +199,95 @@ def plot_future_model_heatmap(future: pd.DataFrame, output_path: Path):
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
+
+
+def plot_tuning_delta_heatmaps(comparison: pd.DataFrame, output_path: Path):
+    metrics = [
+        ("delta_balanced_accuracy", "Delta Balanced Accuracy"),
+        ("delta_spearman_ic", "Delta Spearman IC"),
+        ("delta_strategy_sharpe", "Delta Strategy Sharpe"),
+    ]
+    data = comparison[comparison["model"] != "MACD 12-26-9"].copy()
+    fig, axes = plt.subplots(1, 3, figsize=(17, 6), sharey=True)
+    for ax, (column, title) in zip(axes, metrics):
+        pivot = data.pivot_table(index="model", columns="horizon", values=column)
+        limit = np.nanmax(np.abs(pivot.to_numpy()))
+        limit = max(limit, 0.01)
+        sns.heatmap(
+            pivot,
+            annot=True,
+            fmt=".3f",
+            cmap="RdYlGn",
+            center=0,
+            vmin=-limit,
+            vmax=limit,
+            cbar=False,
+            ax=ax,
+        )
+        ax.set_title(title)
+        ax.set_xlabel("Horizon")
+        ax.set_ylabel("")
+    fig.suptitle("Muc thay doi tren tap test: Tuned - Baseline")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_cv_search_scores(trials: pd.DataFrame, output_path: Path):
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5), sharey=True)
+    for ax, horizon in zip(axes, sorted(trials["horizon"].unique())):
+        subset = trials[trials["horizon"] == horizon].copy()
+        sns.stripplot(
+            data=subset,
+            x="model",
+            y="cv_score",
+            hue="selected",
+            palette={False: "#9e9e9e", True: "#0b5394"},
+            size=6,
+            jitter=0.15,
+            ax=ax,
+        )
+        ax.set_title(f"{horizon} phien")
+        ax.tick_params(axis="x", rotation=35)
+        ax.set_xlabel("")
+        ax.set_ylabel("CV composite score" if ax is axes[0] else "")
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.remove()
+    fig.suptitle("Diem CV cua 4 cau hinh ung vien; mau xanh la tham so duoc chon")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_baseline_vs_tuned(comparison: pd.DataFrame, output_path: Path):
+    data = comparison[comparison["model"] != "MACD 12-26-9"].copy()
+    long = data.melt(
+        id_vars=["horizon", "model"],
+        value_vars=["baseline_composite_score", "tuned_composite_score"],
+        var_name="variant",
+        value_name="composite_score",
+    )
+    long["variant"] = long["variant"].map(
+        {"baseline_composite_score": "Baseline", "tuned_composite_score": "Tuned"}
+    )
+    g = sns.catplot(
+        data=long,
+        x="model",
+        y="composite_score",
+        hue="variant",
+        col="horizon",
+        kind="bar",
+        height=4.2,
+        aspect=1.25,
+        palette={"Baseline": "#9e9e9e", "Tuned": "#0b5394"},
+        sharey=True,
+    )
+    g.set_axis_labels("", "Out-of-sample composite score")
+    g.set_titles("{col_name} phien")
+    for ax in g.axes.flat:
+        ax.tick_params(axis="x", rotation=35)
+    g.fig.suptitle("So sanh composite score tren tap test: Baseline va Tuned", y=1.05)
+    g.fig.tight_layout()
+    g.fig.savefig(output_path)
+    plt.close(g.fig)
